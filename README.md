@@ -81,7 +81,7 @@ Replace the domains with approved names and set each frontend's `VITE_API_BASE_U
 
 ### Vercel API
 
-Create a separate Vercel project connected to this repository, set Root Directory to `apps/api`, keep workspace detection enabled, and let Vercel use its default Node.js runtime. The repository intentionally does not override the runtime in `vercel.json`; Vercel documents Node.js as the default for TypeScript/JavaScript Functions.
+Create a separate Vercel project connected to this repository, set Root Directory to `apps/api`, keep workspace detection enabled, and use the explicit `src/api.ts` serverless entrypoint configured in `apps/api/vercel.json`. Internal modules such as `src/app.ts` are not Function entrypoints.
 
 ```text
 Install Command: npm install --include=dev

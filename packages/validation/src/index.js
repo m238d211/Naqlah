@@ -1,0 +1,10 @@
+import { z } from 'zod';
+import { MAX_FILE_SIZE } from '@naqlah/shared-types';
+export const idSchema = z.string().min(16).max(128);
+export const pairingCodeSchema = z.string().regex(/^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/);
+export const qrClaimSchema = z.object({ sessionId: idSchema, nonce: z.string().min(16), signature: z.string().min(32) });
+export const manualClaimSchema = z.object({ code: pairingCodeSchema });
+export const textTransferSchema = z.object({ text: z.string().min(1).max(100000) });
+export const urlTransferSchema = z.object({ url: z.string().url().max(2048) });
+export const uploadMetadataSchema = z.object({ filename: z.string().min(1).max(255), mimeType: z.string().max(255), size: z.number().int().positive().max(MAX_FILE_SIZE) });
+export const exchangeTokenSchema = z.object({ exchangeToken: z.string().min(20).max(10000) });

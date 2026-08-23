@@ -62,7 +62,9 @@ The current local development adapter returns no Blob URL when Blob is not confi
 
 ## MongoDB and cleanup
 
-The production data model is `users`, `pairing_sessions`, `device_sessions`, and `transfers`, with indexes on user IDs, pairing ownership, hashed lookup references, device sessions, transfer sessions/status, and expiration dates. Pairing and transfer expiration should have MongoDB TTL indexes. TTL does not delete Blob objects, so the protected `POST /api/v1/cleanup` endpoint (header `X-Cron-Secret`) must process bounded batches, delete expired metadata and Blob objects idempotently, and log only counts and IDs safe for operations. Configure cron-job.org to call the deployed endpoint daily with `X-Cron-Secret`; no Vercel Cron is used.
+Production uses the official MongoDB Node.js driver with a cached connection pool. The data model is `users`, `pairing_sessions`, `device_sessions`, and `transfers`. Startup creates indexes for user identifiers, pairing ownership/code/status/expiration, device-session tokens/expiration, and transfer session/status/expiration. Pairing and device sessions use MongoDB TTL indexes. Transfers use a normal expiration index so metadata is not removed before the cleanup job can delete the corresponding private Blob object.
+
+The protected `POST /api/v1/cleanup` endpoint (header `X-Cron-Secret`) processes expired records idempotently. Configure cron-job.org to call the deployed endpoint daily; no Vercel Cron is used. The health endpoint now runs a MongoDB `ping` and returns `database: "ok"` only when MongoDB is reachable.
 
 ## Deployment
 
@@ -95,7 +97,7 @@ Add the API environment variables in the Vercel project, configure MongoDB Atlas
 
 ## Testing and limitations
 
-The included API tests cover safe code generation and hashing, pairing creation, and cron authorization. The initial UI is a lightweight functional shell with polling and accessible form states. QR camera integration, a real Vercel Blob `handleUpload` adapter, MongoDB repository wiring, browser download confirmation, and end-to-end SSO integration require the deployment credentials and platform-specific integration configuration that are intentionally absent from this repository. WebSockets are intentionally deferred; the query layer polls about every two seconds and can be replaced later without changing the UI contract.
+The included API tests cover safe code generation and hashing, pairing creation, and cron authorization. The initial UI is a lightweight functional shell with polling and accessible form states. QR camera integration, a real Vercel Blob `handleUpload` adapter, browser download confirmation, and end-to-end SSO integration require deployment credentials and platform-specific integration configuration. WebSockets are intentionally deferred; the query layer polls about every two seconds and can be replaced later without changing the UI contract.
 
 ## Structure
 

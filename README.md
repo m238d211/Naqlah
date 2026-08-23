@@ -85,7 +85,7 @@ Create a separate Vercel project connected to this repository, set Root Director
 
 ```text
 Install Command: npm install --include=dev
-Build Command: npm run build:api --workspace @naqlah/api
+Build Command: npm run build
 Output Directory: (empty; Functions)
 ```
 

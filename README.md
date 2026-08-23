@@ -89,6 +89,8 @@ Build Command: npm run build
 Output Directory: (empty; Functions)
 ```
 
+The API build script compiles the three workspace packages to `dist` before compiling the API. This is required because Vercel runs Node.js against JavaScript output and must not load the shared packages' TypeScript source files at runtime.
+
 Add the API environment variables in the Vercel project, configure MongoDB Atlas network access and the Vercel Blob private token, and set the daily Cron secret in the Vercel environment. Do not deploy or create these external resources without explicit approval.
 
 ## Testing and limitations

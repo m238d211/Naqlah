@@ -1,0 +1,27 @@
+{
+  "name": "naqlah",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev:web": "npm --workspace apps/web run dev",
+    "dev:mini": "npm --workspace apps/mini-app run dev",
+    "dev:api": "npm --workspace apps/api run dev",
+    "build": "npm run build:web && npm run build:mini && npm run build:api",
+    "build:web": "npm --workspace apps/web run build",
+    "build:mini": "npm --workspace apps/mini-app run build",
+    "build:api": "npm --workspace apps/api run build",
+    "typecheck": "npm run typecheck:packages && npm run typecheck:apps",
+    "typecheck:packages": "npm --workspace @naqlah/shared-types run typecheck && npm --workspace @naqlah/validation run typecheck && npm --workspace @naqlah/config run typecheck",
+    "typecheck:apps": "npm --workspace apps/api run typecheck && npm --workspace apps/web run typecheck && npm --workspace apps/mini-app run typecheck",
+    "lint": "npm run lint:packages && npm run lint:apps",
+    "lint:packages": "npm --workspace @naqlah/shared-types run lint && npm --workspace @naqlah/validation run lint && npm --workspace @naqlah/config run lint",
+    "lint:apps": "npm --workspace apps/api run lint && npm --workspace apps/web run lint && npm --workspace apps/mini-app run lint",
+    "test": "npm --workspace apps/api run test",
+    "postbuild:web": "node scripts/create-spa-fallback.mjs apps/web/dist",
+    "postbuild:mini": "node scripts/create-spa-fallback.mjs apps/mini-app/dist"
+  },
+  "engines": {"node": ">=20"},
+  "type": "module",
+  "devDependencies": {"typescript": "^5.6.3", "tsx": "^4.19.2", "eslint": "^9.16.0", "@typescript-eslint/parser": "^8.18.0"}
+}

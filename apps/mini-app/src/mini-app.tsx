@@ -31,9 +31,11 @@ export function MiniApp() {
         history.replaceState({}, document.title, location.pathname);
         setSession(x);
       })
-      .catch(() =>
+      .catch((error) =>
         setAuthError(
-          "تعذر التحقق من جلسة Super Badi. أعد المحاولة من التطبيق.",
+          error instanceof DOMException && error.name === "AbortError"
+            ? "انتهت مهلة التحقق من جلسة Super Badi. تحقق من اتصال API ثم أعد المحاولة."
+            : "تعذر التحقق من جلسة Super Badi. أعد المحاولة من التطبيق.",
         ),
       );
   }, []);

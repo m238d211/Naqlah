@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { QRCodeSVG } from "qrcode.react";
 import {
   createPairing,
   getPairing,
@@ -207,10 +208,17 @@ export function WebApp() {
           <p className="eyebrow">نقلة / NAQLAH</p>
           <h1>انقلها ببساطة</h1>
           <p>افتح تطبيق نقلة داخل Super Badi وامسح الرمز أو أدخل الكود.</p>
-          <div className="qr" aria-label="رمز QR لجلسة الاقتران">
-            {pairing.qrPayload.slice(0, 12)}
-            <br />
-            <span>QR</span>
+          <div className="qr" style={{ width: 244, height: 244, padding: 12, border: '1px solid #cbd5e1', borderRadius: 12, background: '#fff' }} aria-label="رمز QR لجلسة الاقتران">
+            <QRCodeSVG
+              value={pairing.qrPayload}
+              size={220}
+              level="M"
+              includeMargin
+              fgColor="#0f172a"
+              bgColor="#ffffff"
+              title="امسح هذا الرمز للاقتران"
+              style={{ width: 220, height: 220 }}
+            />
           </div>
           <div className="code-label">رمز الاقتران</div>
           <div className="code">{pairing.manualCode}</div>

@@ -7,14 +7,18 @@ import type {
 const base = import.meta.env.VITE_API_BASE_URL || "http://localhost:8787";
 const token = () => sessionStorage.getItem("naqlah_app_token") || "";
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const res = await fetch(`${base}${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token()}`,
-      ...(init.headers || {}),
-    },
-  });
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 15000);
+  let res: Response;
+  try {
+    res = await fetch(`${base}${path}`, {
+      ...init,
+      signal: controller.signal,
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token()}`, ...(init.headers || {}) },
+    });
+  } finally {
+    window.clearTimeout(timeout);
+  }
   const body = (await res.json()) as ApiResponse<T>;
   if (!res.ok || !body.ok)
     throw new Error(body.ok ? "تعذر تنفيذ الطلب" : body.error.message);

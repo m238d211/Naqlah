@@ -53,3 +53,13 @@ export const authorizeUpload = (id: string, metadata: object) =>
     `/api/v1/pairing/${id}/uploads/authorize`,
     { method: "POST", body: JSON.stringify(metadata) },
   );
+export const requestDownload = (id: string) =>
+  request<{ downloadUrl: string | null; transfer: TransferView }>(
+    `/api/v1/transfers/${id}/download`,
+    { method: "POST" },
+  );
+export const confirmDownloaded = (id: string) =>
+  request<{ status: TransferView["status"] }>(
+    `/api/v1/transfers/${id}/downloaded`,
+    { method: "POST" },
+  );

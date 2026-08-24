@@ -24,11 +24,18 @@ export function connectRealtime(
     },
   });
   const channel = client.channels.get(`naqlah:pairing:${pairingId}`);
+  const handleConnectionState = (change: Ably.ConnectionStateChange) => {
+    if (stopped) return;
+    if (change.current === "connected") onEvent();
+    if (change.current === "failed") onError();
+  };
+  client.connection.on(handleConnectionState);
   void channel.subscribe(() => {
     if (!stopped) onEvent();
   }).catch(() => onError());
   return () => {
     stopped = true;
+    client.connection.off(handleConnectionState);
     channel.unsubscribe();
     client.close();
   };

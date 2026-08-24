@@ -520,7 +520,8 @@ export function MiniApp() {
     queryFn: () => listTransfers(pair!.id),
     enabled: status.data?.status === "active",
     refetchInterval: false,
-    refetchOnWindowFocus: false,
+    refetchOnWindowFocus: true,
+    refetchOnReconnect: true,
   });
   useEffect(() => {
     if (!pair) return;
@@ -528,6 +529,28 @@ export function MiniApp() {
       void queryClient.invalidateQueries({ queryKey: ["pairing", pair.id] });
       void queryClient.invalidateQueries({ queryKey: ["transfers", pair.id] });
     }, () => undefined);
+  }, [pair, queryClient]);
+  useEffect(() => {
+    if (!pair) return;
+    const refreshWhenVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      void queryClient.invalidateQueries({
+        queryKey: ["pairing", pair.id],
+        refetchType: "active",
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["transfers", pair.id],
+        refetchType: "active",
+      });
+    };
+    window.addEventListener("focus", refreshWhenVisible);
+    window.addEventListener("pageshow", refreshWhenVisible);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.removeEventListener("focus", refreshWhenVisible);
+      window.removeEventListener("pageshow", refreshWhenVisible);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
   }, [pair, queryClient]);
   const current = pair?.status === "active" || pair?.status === "rejected" ? pair : status.data || pair;
   if (authError)

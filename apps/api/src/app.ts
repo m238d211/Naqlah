@@ -154,7 +154,7 @@ export function createApp(context?: AppContext): Hono {
       });
       return c.json(
         json({
-          downloadUrl: result.presignedUrl,
+          downloadUrl: `${result.presignedUrl}${result.presignedUrl.includes("?") ? "&" : "?"}download=1`,
           transfer: viewTransfer(transfer!),
         }),
       );
@@ -715,7 +715,12 @@ export function createApp(context?: AppContext): Hono {
       status: "uploading",
       createdAt: now(),
       expiresAt: new Date(Date.now() + env.TRANSFER_TTL_SECONDS * 1000),
-      blobPath: `transfers/${context.pairing.id}/${transferId}`,
+      // Keep a sanitized basename in the Blob pathname. Vercel Blob uses the
+      // pathname basename when it builds Content-Disposition for downloads;
+      // without the extension, mobile WebViews commonly save the file as .bin.
+      blobPath: `transfers/${context.pairing.id}/${transferId}-${body.data.filename
+        .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_")
+        .slice(0, 120)}`,
     };
     await store.setTransfer(transfer);
     return c.json(

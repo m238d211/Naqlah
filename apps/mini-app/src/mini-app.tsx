@@ -2,12 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import jsQR from "jsqr";
+import { upload as blobUpload } from "@vercel/blob/client";
 import {
   authorizeUpload,
   claimManual,
   claimQr,
   close,
-  completeUpload,
   confirm,
   confirmDownloaded,
   exchange,
@@ -18,6 +18,7 @@ import {
   requestDownload,
   sendText,
   sendUrl,
+  uploadHandleUrl,
 } from "./api";
 import type {
   AppSession,
@@ -314,14 +315,7 @@ function Composer({ id }: { id: string }) {
         mimeType: file.type || "application/octet-stream",
         size: file.size,
       });
-      if (!auth.uploadUrl)
-        throw new Error("رفع الملفات غير مهيأ في الخادم بعد");
-      const response = await fetch(auth.uploadUrl, {
-        method: "PUT",
-        body: file,
-      });
-      if (!response.ok) throw new Error("فشل رفع الملف إلى التخزين");
-      await completeUpload(auth.transferId);
+      const response = await blobUpload(auth.blobPath, file, { access: "private", handleUploadUrl: uploadHandleUrl(), clientPayload: JSON.stringify({ transferId: auth.transferId }), headers: { Authorization: `Bearer ${sessionStorage.getItem("naqlah_app_token") || ""}` }, contentType: file.type || "application/octet-stream" });
       toast.success("اكتمل رفع الملف");
     } catch (error) {
       toast.error(messageOf(error, "تعذر رفع الملف"));
@@ -449,7 +443,7 @@ function IncomingItem({ item }: { item: TransferView }) {
 
 function Incoming({ items }: { items: TransferView[] }) {
   const incoming = items.filter(
-    (item) => item.receiver === "mini-app" && item.status !== "deleted",
+    (item) => item.receiver === "mini-app" && ["ready", "downloaded"].includes(item.status),
   );
   return (
     <section className="panel incoming">
@@ -504,7 +498,8 @@ export function MiniApp() {
     queryKey: ["transfers", pair?.id],
     queryFn: () => listTransfers(pair!.id),
     enabled: status.data?.status === "active",
-    refetchInterval: 2000,
+    refetchInterval: () => document.visibilityState === "visible" ? 2000 : false,
+    refetchOnWindowFocus: true,
   });
   const current = status.data || pair;
   if (authError)

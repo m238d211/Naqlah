@@ -12,6 +12,7 @@
     "dependencies": {
         "@naqlah/shared-types": "0.1.0",
         "@tanstack/react-query": "^5.62.8",
+        "@vercel/blob": "^2.8.0",
         "@vitejs/plugin-react": "^4.3.4",
         "jsqr": "^1.4.0",
         "react": "^18.3.1",

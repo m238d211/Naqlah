@@ -1,6 +1,7 @@
 import type { ApiResponse, AppSession, PairingStatusView, TransferView } from "@naqlah/shared-types";
 
 const base = import.meta.env.VITE_API_BASE_URL || "http://localhost:8787";
+export const uploadHandleUrl = () => `${base}/api/v1/uploads/handle`;
 const token = () => sessionStorage.getItem("naqlah_app_token") || "";
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -44,7 +45,7 @@ export const close = (id: string) => request<{ status: PairingStatusView["status
 export const listTransfers = (id: string) => request<TransferView[]>(`/api/v1/pairing/${id}/transfers`);
 export const sendText = (id: string, text: string) => request<TransferView>(`/api/v1/pairing/${id}/transfers/text`, { method: "POST", body: JSON.stringify({ text }) });
 export const sendUrl = (id: string, url: string) => request<TransferView>(`/api/v1/pairing/${id}/transfers/url`, { method: "POST", body: JSON.stringify({ url }) });
-export const authorizeUpload = (id: string, metadata: object) => request<{ transferId: string; uploadUrl: string | null }>(`/api/v1/pairing/${id}/uploads/authorize`, { method: "POST", body: JSON.stringify(metadata) });
+export const authorizeUpload = (id: string, metadata: object) => request<{ transferId: string; uploadUrl: string | null; blobPath: string }>(`/api/v1/pairing/${id}/uploads/authorize`, { method: "POST", body: JSON.stringify(metadata) });
 export const completeUpload = (id: string) => request<TransferView>(`/api/v1/transfers/${id}/complete`, { method: "POST" });
 export const requestDownload = (id: string) => request<{ downloadUrl: string | null; transfer: TransferView }>(`/api/v1/transfers/${id}/download`, { method: "POST" });
 export const confirmDownloaded = (id: string) => request<{ status: TransferView["status"] }>(`/api/v1/transfers/${id}/downloaded`, { method: "POST" });

@@ -1,5 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { issueSignedToken, presignUrl } from "@vercel/blob";
+import { handleUpload } from "@vercel/blob/client";
 import { loadEnv, type AppEnv } from "@naqlah/config";
 import { exchangeTokenSchema, manualClaimSchema, qrClaimSchema, textTransferSchema, uploadMetadataSchema, urlTransferSchema } from "@naqlah/validation";
 import type { ApiResponse, DeviceInfo, PairingSessionView, PairingStatusView, TransferView } from "@naqlah/shared-types";
@@ -19,6 +21,17 @@ export function createApp(context?: AppContext): Hono {
   const store = context?.store || createStore(env);
   const app = new Hono();
   const origins = new Set(env.ALLOWED_ORIGINS.split(",").map((value) => value.trim()).filter(Boolean));
+  app.use("*", cors({ origin: (origin) => origin && origins.has(origin) ? origin : undefined, allowHeaders: ["Content-Type", "Authorization", "X-Naqlah-Device-Token"], allowMethods: ["GET", "POST", "DELETE", "OPTIONS"] }));
+
+  app.use("/api/v1/transfers/:id/download", async (c, next) => {
+    if (c.req.method !== "POST") return next();
+    const claims = await auth(c); const transfer = await store.getTransfer(c.req.param("id")); const pairing = transfer ? await pairingFor(transfer.pairingId) : undefined;
+    const authorized = !!claims && !!transfer && !!pairing && pairing.status === "active" && transfer.status === "ready" && transfer.receiver === claims.kind && (claims.kind === "web" ? claims.pairingId === pairing.id : pairing.userId === String(claims.sub));
+    if (!authorized) return c.json(failure("FORBIDDEN", "لا يمكن تنزيل هذا العنصر", 403).body, 403);
+    if (transfer!.contentType !== "file") return c.json(json({ downloadUrl: null, transfer: viewTransfer(transfer!) }));
+    if (!env.BLOB_READ_WRITE_TOKEN || !transfer!.blobPath) return c.json(failure("BLOB_NOT_READY", "الملف غير جاهز للتنزيل", 409).body, 409);
+    try { const validUntil = Date.now() + 60_000; const signed = await issueSignedToken({ token: env.BLOB_READ_WRITE_TOKEN, pathname: transfer!.blobPath, operations: ["get"], validUntil }); const result = await presignUrl(signed, { access: "private", operation: "get", pathname: transfer!.blobPath, validUntil }); return c.json(json({ downloadUrl: result.presignedUrl, transfer: viewTransfer(transfer!) })); } catch { return c.json(failure("BLOB_DOWNLOAD_FAILED", "تعذر تجهيز تنزيل الملف", 503).body, 503); }
+  });
 
   app.use("*", cors({ origin: (origin) => origin && origins.has(origin) ? origin : undefined, allowHeaders: ["Content-Type", "Authorization", "X-Naqlah-Device-Token"], allowMethods: ["GET", "POST", "DELETE", "OPTIONS"] }));
   app.use("*", async (c, next) => { try { await next(); } catch (cause) { console.error(JSON.stringify({ event: "request_error", message: cause instanceof Error ? cause.message : "unknown" })); return c.json(failure("INTERNAL_ERROR", "حدث خطأ غير متوقع", 500).body, 500); } });
@@ -38,6 +51,39 @@ export function createApp(context?: AppContext): Hono {
     if (!claims || !pairing || pairing.status !== "active" || (claims.kind === "mini-app" && pairing.userId !== String(claims.sub)) || (claims.kind === "web" && claims.pairingId !== pairing.id)) return null;
     return { claims, pairing };
   };
+
+  app.post("/api/v1/uploads/handle", async (c) => {
+    if (!env.BLOB_READ_WRITE_TOKEN) return c.json(failure("BLOB_NOT_CONFIGURED", "تخزين الملفات غير مهيأ", 503).body, 503);
+    const body = await c.req.json().catch(() => null) as any;
+    if (!body || typeof body.type !== "string") return c.json(failure("INVALID_UPLOAD_REQUEST", "طلب رفع الملف غير صالح").body, 400);
+    if (body.type === "blob.upload-completed") {
+      const transferId = (() => { try { return JSON.parse(body.payload?.tokenPayload || "{}").transferId as string; } catch { return ""; } })();
+      const transfer = transferId ? await store.getTransfer(transferId) : undefined;
+      if (!transfer || transfer.status !== "uploading" || body.payload?.blob?.pathname !== transfer.blobPath) return c.json(failure("UPLOAD_NOT_AUTHORIZED", "لا يمكن تأكيد هذا الرفع", 403).body, 403);
+      transfer.status = "ready";
+      transfer.blobPath = body.payload.blob.pathname;
+      await store.setTransfer(transfer);
+      return c.json({ type: "blob.upload-completed", response: "ok" });
+    }
+    const claims = await auth(c);
+    if (!claims || (claims.kind !== "web" && claims.kind !== "mini-app")) return c.json(failure("UNAUTHORIZED", "جلسة الرفع غير مصرح بها", 401).body, 401);
+    try {
+      const result = await handleUpload({
+        token: env.BLOB_READ_WRITE_TOKEN,
+        request: c.req.raw,
+        body,
+        onBeforeGenerateToken: async (_pathname, clientPayload) => {
+          const transferId = (() => { try { return JSON.parse(clientPayload || "{}").transferId as string; } catch { return ""; } })();
+          const transfer = transferId ? await store.getTransfer(transferId) : undefined;
+          const pairing = transfer ? await store.getPairing(transfer.pairingId) : undefined;
+          const owner = !!transfer && !!pairing && pairing.status === "active" && transfer.status === "uploading" && transfer.sender === claims.kind && (claims.kind === "web" ? claims.pairingId === pairing.id : pairing.userId === String(claims.sub));
+          if (!owner || !transfer?.blobPath) throw new Error("upload_not_authorized");
+          return { allowedContentTypes: transfer.mimeType ? [transfer.mimeType] : undefined, maximumSizeInBytes: transfer.size, validUntil: transfer.expiresAt.getTime(), addRandomSuffix: false, allowOverwrite: false, tokenPayload: JSON.stringify({ transferId }), callbackUrl: new URL("/api/v1/uploads/handle", c.req.url).toString() };
+        },
+      });
+      return c.json(result);
+    } catch { return c.json(failure("UPLOAD_AUTHORIZATION_FAILED", "تعذر تجهيز رفع الملف", 400).body, 400); }
+  });
 
   app.get("/api/v1/health", async (c) => { try { await store.ping(); return c.json(json({ status: "ok", service: "naqlah-api", database: "ok" })); } catch { return c.json(failure("DATABASE_UNAVAILABLE", "قاعدة البيانات غير متاحة", 503).body, 503); } });
   app.post("/api/v1/auth/exchange-token", async (c) => { const parsed = exchangeTokenSchema.safeParse(await c.req.json().catch(() => ({}))); if (!parsed.success) return c.json(failure("INVALID_REQUEST", "بيانات الدخول غير صالحة").body, 400); try { const user = await verifyExchangeToken(parsed.data.exchangeToken, env); if (!await store.getUser(user.id)) await store.setUser({ ...user, createdAt: now() }); const accessToken = await signAppToken({ sub: user.id, kind: "mini-app", email: user.email, name: user.name }, env, `${env.ACTIVE_PAIRING_TTL_SECONDS}s`); const expiresAt = new Date(Date.now() + env.ACTIVE_PAIRING_TTL_SECONDS * 1000); await store.setSession({ tokenHash: hashSecret(accessToken), pairingId: "", kind: "mini-app", userId: user.id, expiresAt }); return c.json(json({ accessToken, expiresAt: expiresAt.toISOString(), user: { id: user.id, name: user.name, email: user.email } })); } catch { return c.json(failure("SSO_REJECTED", "تعذر التحقق من جلسة Super Badi", 401).body, 401); } });

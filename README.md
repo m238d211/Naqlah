@@ -58,7 +58,7 @@ Pairing codes use cryptographic randomness, omit `0/O/1/I`, are stored as SHA-25
 
 Files are limited to 100 MB. The upload endpoint creates metadata and an authorization for direct private Blob upload; file bytes must not be proxied through a Vercel Function. Receivers get temporary authorized access and confirm successful download before delayed cleanup. Unknown or executable types should be downloaded as attachments and must not be treated as malware-free.
 
-The current local development adapter returns no Blob URL when Blob is not configured, making this limitation visible rather than silently accepting a fake upload. The production deployment must connect the upload authorization and completion hooks to Vercel Blob private storage.
+Client uploads use `@vercel/blob/client` with the API's `/api/v1/uploads/handle` route. The API validates the active pairing and file metadata before issuing a short-lived Blob client token. The Blob completion callback marks metadata `ready`; receivers get a short-lived presigned private download URL. If `BLOB_READ_WRITE_TOKEN` is missing, uploads fail clearly and incomplete `uploading` records are not shown as received.
 
 ## MongoDB and cleanup
 

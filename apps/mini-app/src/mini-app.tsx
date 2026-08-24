@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import jsQR from "jsqr";
-import { upload as blobUpload } from "@vercel/blob/client";
+import { upload as blobUpload } from "./upload";
 import {
   authorizeUpload,
   claimManual,
@@ -26,6 +26,7 @@ import type {
   TransferView,
 } from "@naqlah/shared-types";
 import { connectRealtime } from "./realtime";
+import { downloadPrivateFile } from "./download";
 
 const codePattern = /^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/;
 const messageOf = (error: unknown, fallback: string) =>
@@ -316,7 +317,7 @@ function Composer({ id }: { id: string }) {
         mimeType: file.type || "application/octet-stream",
         size: file.size,
       });
-      const response = await blobUpload(auth.blobPath, file, { access: "private", handleUploadUrl: uploadHandleUrl(), clientPayload: JSON.stringify({ transferId: auth.transferId }), headers: { Authorization: `Bearer ${sessionStorage.getItem("naqlah_app_token") || ""}` }, contentType: file.type || "application/octet-stream" });
+      await blobUpload(auth.blobPath, file, { access: "private", handleUploadUrl: uploadHandleUrl(), clientPayload: JSON.stringify({ transferId: auth.transferId }), headers: { Authorization: `Bearer ${sessionStorage.getItem("naqlah_app_token") || ""}` }, contentType: file.type || "application/octet-stream" });
       toast.success("اكتمل رفع الملف");
     } catch (error) {
       toast.error(messageOf(error, "تعذر رفع الملف"));
@@ -393,7 +394,7 @@ function Composer({ id }: { id: string }) {
   );
 }
 
-function IncomingItem({ item }: { item: TransferView }) {
+function LegacyIncomingItem({ item }: { item: TransferView }) {
   const [busy, setBusy] = useState(false);
   const open = async () => {
     setBusy(true);
@@ -440,6 +441,27 @@ function IncomingItem({ item }: { item: TransferView }) {
       </button>
     </article>
   );
+}
+function IncomingFileItem({ item }: { item: TransferView }) {
+  const [busy, setBusy] = useState(false);
+  const download = async () => {
+    setBusy(true);
+    try {
+      const result = await requestDownload(item.id);
+      if (!result.downloadUrl) throw new Error("download_not_ready");
+      await downloadPrivateFile(result.downloadUrl, item.displayFilename || item.filename || "naqlah-file");
+      await confirmDownloaded(item.id);
+      toast.success("تم تنزيل الملف");
+    } catch (error) {
+      toast.error(messageOf(error, "تعذر تنزيل الملف"));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <article className="transfer"><div><strong className="wrap-anywhere">{item.displayFilename || item.filename || "ملف"}</strong><small>جاهز للتنزيل</small></div><button type="button" className="secondary compact" disabled={busy || !["ready", "downloaded"].includes(item.status)} onClick={() => void download()}>تنزيل</button></article>;
+}
+function IncomingItem({ item }: { item: TransferView }) {
+  return item.contentType === "file" ? <IncomingFileItem item={item} /> : <LegacyIncomingItem item={item} />;
 }
 
 function Incoming({ items }: { items: TransferView[] }) {
@@ -507,7 +529,7 @@ export function MiniApp() {
       void queryClient.invalidateQueries({ queryKey: ["transfers", pair.id] });
     }, () => undefined);
   }, [pair, queryClient]);
-  const current = status.data || pair;
+  const current = pair?.status === "active" || pair?.status === "rejected" ? pair : status.data || pair;
   if (authError)
     return (
       <main className="center">

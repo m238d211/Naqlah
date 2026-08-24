@@ -119,7 +119,7 @@ export function createApp(context?: AppContext): Hono {
       !!transfer &&
       !!pairing &&
       pairing.status === "active" &&
-      transfer.status === "ready" &&
+      ["ready", "downloaded"].includes(transfer.status) &&
       transfer.receiver === claims.kind &&
       (claims.kind === "web"
         ? claims.pairingId === pairing.id
@@ -771,7 +771,7 @@ export function createApp(context?: AppContext): Hono {
       !!transfer &&
       !!pairing &&
       pairing.status === "active" &&
-      transfer.status === "ready" &&
+      ["ready", "downloaded"].includes(transfer.status) &&
       transfer.receiver === claims.kind &&
       (claims.kind === "web"
         ? claims.pairingId === pairing.id

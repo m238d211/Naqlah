@@ -3,109 +3,852 @@ import { cors } from "hono/cors";
 import { issueSignedToken, presignUrl } from "@vercel/blob";
 import { handleUpload } from "@vercel/blob/client";
 import { loadEnv, type AppEnv } from "@naqlah/config";
-import { exchangeTokenSchema, manualClaimSchema, qrClaimSchema, textTransferSchema, uploadMetadataSchema, urlTransferSchema } from "@naqlah/validation";
-import type { ApiResponse, DeviceInfo, PairingSessionView, PairingStatusView, TransferView } from "@naqlah/shared-types";
-import { generatePairingCode, hashSecret, parseQrPayload, randomId, signAppToken, signedQrPayload, verifyAppToken, verifyExchangeToken } from "./security.js";
-import { createStore, type Pairing, type Store, type Transfer } from "./store.js";
+import {
+  exchangeTokenSchema,
+  manualClaimSchema,
+  qrClaimSchema,
+  textTransferSchema,
+  uploadMetadataSchema,
+  urlTransferSchema,
+} from "@naqlah/validation";
+import type {
+  ApiResponse,
+  DeviceInfo,
+  PairingSessionView,
+  PairingStatusView,
+  TransferView,
+} from "@naqlah/shared-types";
+import {
+  generatePairingCode,
+  hashSecret,
+  parseQrPayload,
+  randomId,
+  signAppToken,
+  signedQrPayload,
+  verifyAppToken,
+  verifyExchangeToken,
+} from "./security.js";
+import {
+  createStore,
+  type Pairing,
+  type Store,
+  type Transfer,
+} from "./store.js";
+import {
+  createRealtimePublisher,
+  type RealtimeEventName,
+} from "./realtime.js";
 
-export interface AppContext { env: AppEnv; store: Store }
+export interface AppContext {
+  env: AppEnv;
+  store: Store;
+}
 const json = <T>(data: T): ApiResponse<T> => ({ ok: true, data });
-const failure = (code: string, message: string, status = 400) => ({ body: { ok: false, error: { code, message } } as const, status });
+const failure = (code: string, message: string, status = 400) => ({
+  body: { ok: false, error: { code, message } } as const,
+  status,
+});
 const now = () => new Date();
-function deviceFromHeader(kind: "web" | "mini-app", headers: Headers): DeviceInfo { return { kind, browser: headers.get("x-naqlah-browser") || undefined, operatingSystem: headers.get("x-naqlah-os") || undefined, createdAt: now().toISOString() }; }
-function viewPairing(pairing: Pairing, includeCode = false): PairingSessionView { return { id: pairing.id, qrPayload: pairing.qrPayload, manualCode: includeCode ? pairing.manualCode || "" : "", expiresAt: pairing.expiresAt.toISOString(), status: pairing.status, device: pairing.device }; }
-function viewTransfer(transfer: Transfer): TransferView { return { ...transfer, createdAt: transfer.createdAt.toISOString(), expiresAt: transfer.expiresAt.toISOString() }; }
+function deviceFromHeader(
+  kind: "web" | "mini-app",
+  headers: Headers,
+): DeviceInfo {
+  return {
+    kind,
+    browser: headers.get("x-naqlah-browser") || undefined,
+    operatingSystem: headers.get("x-naqlah-os") || undefined,
+    createdAt: now().toISOString(),
+  };
+}
+function viewPairing(
+  pairing: Pairing,
+  includeCode = false,
+): PairingSessionView {
+  return {
+    id: pairing.id,
+    qrPayload: pairing.qrPayload,
+    manualCode: includeCode ? pairing.manualCode || "" : "",
+    expiresAt: pairing.expiresAt.toISOString(),
+    status: pairing.status,
+    device: pairing.device,
+  };
+}
+function viewTransfer(transfer: Transfer): TransferView {
+  return {
+    ...transfer,
+    createdAt: transfer.createdAt.toISOString(),
+    expiresAt: transfer.expiresAt.toISOString(),
+  };
+}
 
 export function createApp(context?: AppContext): Hono {
   const env = context?.env || loadEnv();
   const store = context?.store || createStore(env);
+  const realtime = createRealtimePublisher(env);
   const app = new Hono();
-  const origins = new Set(env.ALLOWED_ORIGINS.split(",").map((value) => value.trim()).filter(Boolean));
-  app.use("*", cors({ origin: (origin) => origin && origins.has(origin) ? origin : undefined, allowHeaders: ["Content-Type", "Authorization", "X-Naqlah-Device-Token"], allowMethods: ["GET", "POST", "DELETE", "OPTIONS"] }));
+  const publish = (
+    pairingId: string,
+    name: RealtimeEventName,
+    data: Record<string, unknown> = {},
+  ): void => {
+    void realtime.publish(pairingId, name, data).catch((cause) => {
+      console.error(JSON.stringify({ event: "realtime_publish_failed", name, message: cause instanceof Error ? cause.message : "unknown" }));
+    });
+  };
+  const origins = new Set(
+    env.ALLOWED_ORIGINS.split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
+  app.use(
+    "*",
+    cors({
+      origin: (origin) => (origin && origins.has(origin) ? origin : undefined),
+      allowHeaders: ["Content-Type", "Authorization", "X-Naqlah-Device-Token"],
+      allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
+    }),
+  );
 
   app.use("/api/v1/transfers/:id/download", async (c, next) => {
     if (c.req.method !== "POST") return next();
-    const claims = await auth(c); const transfer = await store.getTransfer(c.req.param("id")); const pairing = transfer ? await pairingFor(transfer.pairingId) : undefined;
-    const authorized = !!claims && !!transfer && !!pairing && pairing.status === "active" && transfer.status === "ready" && transfer.receiver === claims.kind && (claims.kind === "web" ? claims.pairingId === pairing.id : pairing.userId === String(claims.sub));
-    if (!authorized) return c.json(failure("FORBIDDEN", "لا يمكن تنزيل هذا العنصر", 403).body, 403);
-    if (transfer!.contentType !== "file") return c.json(json({ downloadUrl: null, transfer: viewTransfer(transfer!) }));
-    if (!env.BLOB_READ_WRITE_TOKEN || !transfer!.blobPath) return c.json(failure("BLOB_NOT_READY", "الملف غير جاهز للتنزيل", 409).body, 409);
-    try { const validUntil = Date.now() + 60_000; const signed = await issueSignedToken({ token: env.BLOB_READ_WRITE_TOKEN, pathname: transfer!.blobPath, operations: ["get"], validUntil }); const result = await presignUrl(signed, { access: "private", operation: "get", pathname: transfer!.blobPath, validUntil }); return c.json(json({ downloadUrl: result.presignedUrl, transfer: viewTransfer(transfer!) })); } catch { return c.json(failure("BLOB_DOWNLOAD_FAILED", "تعذر تجهيز تنزيل الملف", 503).body, 503); }
+    const claims = await auth(c);
+    const transfer = await store.getTransfer(c.req.param("id"));
+    const pairing = transfer ? await pairingFor(transfer.pairingId) : undefined;
+    const authorized =
+      !!claims &&
+      !!transfer &&
+      !!pairing &&
+      pairing.status === "active" &&
+      transfer.status === "ready" &&
+      transfer.receiver === claims.kind &&
+      (claims.kind === "web"
+        ? claims.pairingId === pairing.id
+        : pairing.userId === String(claims.sub));
+    if (!authorized)
+      return c.json(
+        failure("FORBIDDEN", "لا يمكن تنزيل هذا العنصر", 403).body,
+        403,
+      );
+    if (transfer!.contentType !== "file")
+      return c.json(
+        json({ downloadUrl: null, transfer: viewTransfer(transfer!) }),
+      );
+    if (!env.BLOB_READ_WRITE_TOKEN || !transfer!.blobPath)
+      return c.json(
+        failure("BLOB_NOT_READY", "الملف غير جاهز للتنزيل", 409).body,
+        409,
+      );
+    try {
+      const validUntil = Date.now() + 60_000;
+      const signed = await issueSignedToken({
+        token: env.BLOB_READ_WRITE_TOKEN,
+        pathname: transfer!.blobPath,
+        operations: ["get"],
+        validUntil,
+      });
+      const result = await presignUrl(signed, {
+        access: "private",
+        operation: "get",
+        pathname: transfer!.blobPath,
+        validUntil,
+      });
+      return c.json(
+        json({
+          downloadUrl: result.presignedUrl,
+          transfer: viewTransfer(transfer!),
+        }),
+      );
+    } catch {
+      return c.json(
+        failure("BLOB_DOWNLOAD_FAILED", "تعذر تجهيز تنزيل الملف", 503).body,
+        503,
+      );
+    }
   });
 
-  app.use("*", cors({ origin: (origin) => origin && origins.has(origin) ? origin : undefined, allowHeaders: ["Content-Type", "Authorization", "X-Naqlah-Device-Token"], allowMethods: ["GET", "POST", "DELETE", "OPTIONS"] }));
-  app.use("*", async (c, next) => { try { await next(); } catch (cause) { console.error(JSON.stringify({ event: "request_error", message: cause instanceof Error ? cause.message : "unknown" })); return c.json(failure("INTERNAL_ERROR", "حدث خطأ غير متوقع", 500).body, 500); } });
+  app.use(
+    "*",
+    cors({
+      origin: (origin) => (origin && origins.has(origin) ? origin : undefined),
+      allowHeaders: ["Content-Type", "Authorization", "X-Naqlah-Device-Token"],
+      allowMethods: ["GET", "POST", "DELETE", "OPTIONS"],
+    }),
+  );
+  app.use("*", async (c, next) => {
+    try {
+      await next();
+    } catch (cause) {
+      console.error(
+        JSON.stringify({
+          event: "request_error",
+          message: cause instanceof Error ? cause.message : "unknown",
+        }),
+      );
+      return c.json(
+        failure("INTERNAL_ERROR", "حدث خطأ غير متوقع", 500).body,
+        500,
+      );
+    }
+  });
 
   const auth = async (c: any) => {
-    const token = c.req.header("Authorization")?.replace(/^Bearer\s+/i, "") || c.req.header("X-Naqlah-Device-Token");
+    const token =
+      c.req.header("Authorization")?.replace(/^Bearer\s+/i, "") ||
+      c.req.header("X-Naqlah-Device-Token");
     if (!token) return null;
-    try { const claims = await verifyAppToken(token, env); const session = await store.getSession(hashSecret(token)); return session && session.expiresAt > now() ? claims : null; } catch { return null; }
+    try {
+      const claims = await verifyAppToken(token, env);
+      const session = await store.getSession(hashSecret(token));
+      return session && session.expiresAt > now() ? claims : null;
+    } catch {
+      return null;
+    }
   };
   const pairingFor = async (id: string) => {
     const pairing = await store.getPairing(id);
-    if (!pairing || pairing.expiresAt <= now()) { if (pairing && pairing.status !== "closed") { pairing.status = "expired"; await store.setPairing(pairing); } return null; }
+    if (!pairing || pairing.expiresAt <= now()) {
+      if (pairing && pairing.status !== "closed") {
+        pairing.status = "expired";
+        await store.setPairing(pairing);
+      }
+      return null;
+    }
     return pairing;
   };
   const activePairing = async (c: any) => {
-    const claims = await auth(c); const pairing = await pairingFor(c.req.param("id"));
-    if (!claims || !pairing || pairing.status !== "active" || (claims.kind === "mini-app" && pairing.userId !== String(claims.sub)) || (claims.kind === "web" && claims.pairingId !== pairing.id)) return null;
+    const claims = await auth(c);
+    const pairing = await pairingFor(c.req.param("id"));
+    if (
+      !claims ||
+      !pairing ||
+      pairing.status !== "active" ||
+      (claims.kind === "mini-app" && pairing.userId !== String(claims.sub)) ||
+      (claims.kind === "web" && claims.pairingId !== pairing.id)
+    )
+      return null;
     return { claims, pairing };
   };
 
+  app.get("/api/v1/realtime/token", async (c) => {
+    const claims = await auth(c);
+    const pairing = await pairingFor(c.req.query("pairingId") || "");
+    const authorized =
+      !!claims &&
+      !!pairing &&
+      ["pending", "claimed", "active"].includes(pairing.status) &&
+      (claims.kind === "web"
+        ? claims.pairingId === pairing.id
+        : pairing.userId === String(claims.sub));
+    if (!authorized)
+      return c.json(failure("FORBIDDEN", "Ø§Ù„Ø¬Ù„Ø³Ø© ØºÙŠØ± Ù…ØµØ±Ø­ Ø¨Ù‡Ø§", 403).body, 403);
+    if (!realtime.enabled)
+      return c.json(failure("REALTIME_NOT_CONFIGURED", "Ø§Ù„Ø§ØªØµØ§Ù„ Ø§Ù„Ù„Ø­Ø¸ÙŠ ØºÙŠØ± Ù…Ù‡ÙŠØ£", 503).body, 503);
+    try {
+      const clientId = `${claims.kind}:${claims.kind === "web" ? claims.pairingId : claims.sub}`;
+      const token = await realtime.issueToken(pairing.id, clientId);
+      return c.json(json(token));
+    } catch {
+      return c.json(failure("REALTIME_TOKEN_FAILED", "ØªØ¹Ø°Ø± ØªØ¬Ù‡ÙŠØ² Ø§Ù„Ø§ØªØµØ§Ù„ Ø§Ù„Ù„Ø­Ø¸ÙŠ", 503).body, 503);
+    }
+  });
+
   app.post("/api/v1/uploads/handle", async (c) => {
-    if (!env.BLOB_READ_WRITE_TOKEN) return c.json(failure("BLOB_NOT_CONFIGURED", "تخزين الملفات غير مهيأ", 503).body, 503);
-    const body = await c.req.json().catch(() => null) as any;
-    if (!body || typeof body.type !== "string") return c.json(failure("INVALID_UPLOAD_REQUEST", "طلب رفع الملف غير صالح").body, 400);
+    if (!env.BLOB_READ_WRITE_TOKEN)
+      return c.json(
+        failure("BLOB_NOT_CONFIGURED", "تخزين الملفات غير مهيأ", 503).body,
+        503,
+      );
+    const body = (await c.req.json().catch(() => null)) as any;
+    if (!body || typeof body.type !== "string")
+      return c.json(
+        failure("INVALID_UPLOAD_REQUEST", "طلب رفع الملف غير صالح").body,
+        400,
+      );
     if (body.type === "blob.upload-completed") {
-      const transferId = (() => { try { return JSON.parse(body.payload?.tokenPayload || "{}").transferId as string; } catch { return ""; } })();
-      const transfer = transferId ? await store.getTransfer(transferId) : undefined;
-      if (!transfer || transfer.status !== "uploading" || body.payload?.blob?.pathname !== transfer.blobPath) return c.json(failure("UPLOAD_NOT_AUTHORIZED", "لا يمكن تأكيد هذا الرفع", 403).body, 403);
+      const transferId = (() => {
+        try {
+          return JSON.parse(body.payload?.tokenPayload || "{}")
+            .transferId as string;
+        } catch {
+          return "";
+        }
+      })();
+      const transfer = transferId
+        ? await store.getTransfer(transferId)
+        : undefined;
+      if (
+        !transfer ||
+        transfer.status !== "uploading" ||
+        body.payload?.blob?.pathname !== transfer.blobPath
+      )
+        return c.json(
+          failure("UPLOAD_NOT_AUTHORIZED", "لا يمكن تأكيد هذا الرفع", 403).body,
+          403,
+        );
       transfer.status = "ready";
       transfer.blobPath = body.payload.blob.pathname;
       await store.setTransfer(transfer);
+      publish(transfer.pairingId, "transfer.ready", { transferId: transfer.id, status: transfer.status });
       return c.json({ type: "blob.upload-completed", response: "ok" });
     }
     const claims = await auth(c);
-    if (!claims || (claims.kind !== "web" && claims.kind !== "mini-app")) return c.json(failure("UNAUTHORIZED", "جلسة الرفع غير مصرح بها", 401).body, 401);
+    if (!claims || (claims.kind !== "web" && claims.kind !== "mini-app"))
+      return c.json(
+        failure("UNAUTHORIZED", "جلسة الرفع غير مصرح بها", 401).body,
+        401,
+      );
     try {
       const result = await handleUpload({
         token: env.BLOB_READ_WRITE_TOKEN,
         request: c.req.raw,
         body,
         onBeforeGenerateToken: async (_pathname, clientPayload) => {
-          const transferId = (() => { try { return JSON.parse(clientPayload || "{}").transferId as string; } catch { return ""; } })();
-          const transfer = transferId ? await store.getTransfer(transferId) : undefined;
-          const pairing = transfer ? await store.getPairing(transfer.pairingId) : undefined;
-          const owner = !!transfer && !!pairing && pairing.status === "active" && transfer.status === "uploading" && transfer.sender === claims.kind && (claims.kind === "web" ? claims.pairingId === pairing.id : pairing.userId === String(claims.sub));
-          if (!owner || !transfer?.blobPath) throw new Error("upload_not_authorized");
-          return { allowedContentTypes: transfer.mimeType ? [transfer.mimeType] : undefined, maximumSizeInBytes: transfer.size, validUntil: transfer.expiresAt.getTime(), addRandomSuffix: false, allowOverwrite: false, tokenPayload: JSON.stringify({ transferId }), callbackUrl: new URL("/api/v1/uploads/handle", c.req.url).toString() };
+          const transferId = (() => {
+            try {
+              return JSON.parse(clientPayload || "{}").transferId as string;
+            } catch {
+              return "";
+            }
+          })();
+          const transfer = transferId
+            ? await store.getTransfer(transferId)
+            : undefined;
+          const pairing = transfer
+            ? await store.getPairing(transfer.pairingId)
+            : undefined;
+          const owner =
+            !!transfer &&
+            !!pairing &&
+            pairing.status === "active" &&
+            transfer.status === "uploading" &&
+            transfer.sender === claims.kind &&
+            (claims.kind === "web"
+              ? claims.pairingId === pairing.id
+              : pairing.userId === String(claims.sub));
+          if (!owner || !transfer?.blobPath)
+            throw new Error("upload_not_authorized");
+          return {
+            allowedContentTypes: transfer.mimeType
+              ? [transfer.mimeType]
+              : undefined,
+            maximumSizeInBytes: transfer.size,
+            validUntil: transfer.expiresAt.getTime(),
+            addRandomSuffix: false,
+            allowOverwrite: false,
+            tokenPayload: JSON.stringify({ transferId }),
+            callbackUrl: new URL(
+              "/api/v1/uploads/handle",
+              c.req.url,
+            ).toString(),
+          };
         },
       });
       return c.json(result);
-    } catch { return c.json(failure("UPLOAD_AUTHORIZATION_FAILED", "تعذر تجهيز رفع الملف", 400).body, 400); }
+    } catch {
+      return c.json(
+        failure("UPLOAD_AUTHORIZATION_FAILED", "تعذر تجهيز رفع الملف", 400)
+          .body,
+        400,
+      );
+    }
   });
 
-  app.get("/api/v1/health", async (c) => { try { await store.ping(); return c.json(json({ status: "ok", service: "naqlah-api", database: "ok" })); } catch { return c.json(failure("DATABASE_UNAVAILABLE", "قاعدة البيانات غير متاحة", 503).body, 503); } });
-  app.post("/api/v1/auth/exchange-token", async (c) => { const parsed = exchangeTokenSchema.safeParse(await c.req.json().catch(() => ({}))); if (!parsed.success) return c.json(failure("INVALID_REQUEST", "بيانات الدخول غير صالحة").body, 400); try { const user = await verifyExchangeToken(parsed.data.exchangeToken, env); if (!await store.getUser(user.id)) await store.setUser({ ...user, createdAt: now() }); const accessToken = await signAppToken({ sub: user.id, kind: "mini-app", email: user.email, name: user.name }, env, `${env.ACTIVE_PAIRING_TTL_SECONDS}s`); const expiresAt = new Date(Date.now() + env.ACTIVE_PAIRING_TTL_SECONDS * 1000); await store.setSession({ tokenHash: hashSecret(accessToken), pairingId: "", kind: "mini-app", userId: user.id, expiresAt }); return c.json(json({ accessToken, expiresAt: expiresAt.toISOString(), user: { id: user.id, name: user.name, email: user.email } })); } catch { return c.json(failure("SSO_REJECTED", "تعذر التحقق من جلسة Super Badi", 401).body, 401); } });
+  app.get("/api/v1/health", async (c) => {
+    try {
+      await store.ping();
+      return c.json(
+        json({ status: "ok", service: "naqlah-api", database: "ok" }),
+      );
+    } catch {
+      return c.json(
+        failure("DATABASE_UNAVAILABLE", "قاعدة البيانات غير متاحة", 503).body,
+        503,
+      );
+    }
+  });
+  app.post("/api/v1/auth/exchange-token", async (c) => {
+    const parsed = exchangeTokenSchema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!parsed.success)
+      return c.json(
+        failure("INVALID_REQUEST", "بيانات الدخول غير صالحة").body,
+        400,
+      );
+    try {
+      const user = await verifyExchangeToken(parsed.data.exchangeToken, env);
+      if (!(await store.getUser(user.id)))
+        await store.setUser({ ...user, createdAt: now() });
+      const accessToken = await signAppToken(
+        { sub: user.id, kind: "mini-app", email: user.email, name: user.name },
+        env,
+        `${env.ACTIVE_PAIRING_TTL_SECONDS}s`,
+      );
+      const expiresAt = new Date(
+        Date.now() + env.ACTIVE_PAIRING_TTL_SECONDS * 1000,
+      );
+      await store.setSession({
+        tokenHash: hashSecret(accessToken),
+        pairingId: "",
+        kind: "mini-app",
+        userId: user.id,
+        expiresAt,
+      });
+      return c.json(
+        json({
+          accessToken,
+          expiresAt: expiresAt.toISOString(),
+          user: { id: user.id, name: user.name, email: user.email },
+        }),
+      );
+    } catch {
+      return c.json(
+        failure("SSO_REJECTED", "تعذر التحقق من جلسة Super Badi", 401).body,
+        401,
+      );
+    }
+  });
 
-  app.post("/api/v1/pairing", async (c) => { const device = deviceFromHeader("web", c.req.raw.headers); const id = randomId(); const nonce = randomId(); const manualCode = generatePairingCode(); const pairing: Pairing = { id, codeHash: hashSecret(manualCode), manualCode, qrPayload: signedQrPayload(id, nonce, env.PAIRING_TOKEN_SECRET), nonce, device, status: "pending", attempts: 0, expiresAt: new Date(Date.now() + env.PAIRING_CODE_TTL_SECONDS * 1000), createdAt: now(), used: false }; await store.setPairing(pairing); const sessionExpiresAt = new Date(Date.now() + env.ACTIVE_PAIRING_TTL_SECONDS * 1000); const deviceToken = await signAppToken({ sub: id, kind: "web", pairingId: id }, env, `${env.ACTIVE_PAIRING_TTL_SECONDS}s`); await store.setSession({ tokenHash: hashSecret(deviceToken), pairingId: id, kind: "web", expiresAt: sessionExpiresAt }); return c.json(json({ ...viewPairing(pairing, true), deviceToken })); });
-  app.post("/api/v1/pairing/:id/regenerate", async (c) => { const pairing = await pairingFor(c.req.param("id")); if (!pairing || pairing.status !== "pending") return c.json(failure("PAIRING_UNAVAILABLE", "جلسة الاقتران غير متاحة", 410).body, 410); const manualCode = generatePairingCode(); pairing.codeHash = hashSecret(manualCode); pairing.manualCode = manualCode; pairing.attempts = 0; pairing.expiresAt = new Date(Date.now() + env.PAIRING_CODE_TTL_SECONDS * 1000); pairing.used = false; await store.setPairing(pairing); return c.json(json({ manualCode, expiresAt: pairing.expiresAt.toISOString() })); });
-  app.post("/api/v1/pairing/claim/manual", async (c) => { const claims = await auth(c); if (!claims || claims.kind !== "mini-app") return c.json(failure("UNAUTHORIZED", "يلزم تسجيل الدخول من Mini App", 401).body, 401); const parsed = manualClaimSchema.safeParse(await c.req.json().catch(() => ({}))); if (!parsed.success) return c.json(failure("INVALID_CODE", "رمز الاقتران غير صالح").body, 400); const pairing = await store.findPendingPairingByCodeHash(hashSecret(parsed.data.code), now()); if (!pairing || pairing.attempts >= 5 || pairing.used) return c.json(failure("PAIRING_UNAVAILABLE", "رمز الاقتران غير صالح أو منتهي", 410).body, 410); pairing.status = "claimed"; pairing.userId = String(claims.sub); pairing.userName = String(claims.name || claims.email); pairing.used = true; await store.setPairing(pairing); return c.json(json({ id: pairing.id, status: pairing.status, device: pairing.device, expiresAt: pairing.expiresAt.toISOString() } as PairingStatusView)); });
-  app.post("/api/v1/pairing/claim/qr", async (c) => { const claims = await auth(c); if (!claims || claims.kind !== "mini-app") return c.json(failure("UNAUTHORIZED", "يلزم تسجيل الدخول من Mini App", 401).body, 401); const parsed = qrClaimSchema.safeParse(await c.req.json().catch(() => ({}))); if (!parsed.success) return c.json(failure("INVALID_QR", "رمز QR غير صالح").body, 400); let qr: { sessionId: string; nonce: string }; try { qr = parseQrPayload(`${parsed.data.sessionId}.${parsed.data.nonce}.${parsed.data.signature}`, env.PAIRING_TOKEN_SECRET); } catch { return c.json(failure("INVALID_QR", "رمز QR غير صالح").body, 400); } const pairing = await pairingFor(qr.sessionId); if (!pairing || pairing.nonce !== qr.nonce || pairing.status !== "pending") return c.json(failure("PAIRING_UNAVAILABLE", "جلسة الاقتران غير متاحة", 410).body, 410); pairing.status = "claimed"; pairing.userId = String(claims.sub); pairing.userName = String(claims.name || claims.email); pairing.used = true; await store.setPairing(pairing); return c.json(json({ id: pairing.id, status: pairing.status, device: pairing.device, expiresAt: pairing.expiresAt.toISOString() } as PairingStatusView)); });
-  app.get("/api/v1/pairing/:id", async (c) => { const claims = await auth(c); const pairing = await pairingFor(c.req.param("id")); if (!claims || !pairing || (claims.kind === "web" && claims.pairingId !== pairing.id) || (claims.kind === "mini-app" && pairing.userId !== String(claims.sub))) return c.json(failure("FORBIDDEN", "لا يمكن الوصول إلى هذه الجلسة", 403).body, 403); return c.json(json({ id: pairing.id, status: pairing.status, expiresAt: pairing.expiresAt.toISOString(), userName: pairing.userName, device: pairing.device } as PairingStatusView)); });
-  app.post("/api/v1/pairing/:id/confirm", async (c) => { const claims = await auth(c); const pairing = await pairingFor(c.req.param("id")); if (!claims || !pairing || pairing.userId !== String(claims.sub) || pairing.status !== "claimed") return c.json(failure("FORBIDDEN", "لا يمكن تأكيد هذه الجلسة", 403).body, 403); pairing.status = "active"; pairing.expiresAt = new Date(Date.now() + env.ACTIVE_PAIRING_TTL_SECONDS * 1000); await store.setPairing(pairing); return c.json(json({ status: pairing.status })); });
-  app.post("/api/v1/pairing/:id/reject", async (c) => { const claims = await auth(c); const pairing = await pairingFor(c.req.param("id")); if (!claims || !pairing || pairing.userId !== String(claims.sub) || pairing.status !== "claimed") return c.json(failure("FORBIDDEN", "لا يمكن رفض هذه الجلسة", 403).body, 403); pairing.status = "rejected"; await store.setPairing(pairing); return c.json(json({ status: pairing.status })); });
-  app.post("/api/v1/pairing/:id/close", async (c) => { const claims = await auth(c); const pairing = await pairingFor(c.req.param("id")); if (!claims || !pairing || (claims.kind !== "web" && pairing.userId !== String(claims.sub)) || (claims.kind === "web" && claims.pairingId !== pairing.id)) return c.json(failure("FORBIDDEN", "لا يمكن إغلاق هذه الجلسة", 403).body, 403); pairing.status = "closed"; await store.setPairing(pairing); return c.json(json({ status: pairing.status })); });
+  app.post("/api/v1/pairing", async (c) => {
+    const device = deviceFromHeader("web", c.req.raw.headers);
+    const id = randomId();
+    const nonce = randomId();
+    const manualCode = generatePairingCode();
+    const pairing: Pairing = {
+      id,
+      codeHash: hashSecret(manualCode),
+      manualCode,
+      qrPayload: signedQrPayload(id, nonce, env.PAIRING_TOKEN_SECRET),
+      nonce,
+      device,
+      status: "pending",
+      attempts: 0,
+      expiresAt: new Date(Date.now() + env.PAIRING_CODE_TTL_SECONDS * 1000),
+      createdAt: now(),
+      used: false,
+    };
+    await store.setPairing(pairing);
+    const sessionExpiresAt = new Date(
+      Date.now() + env.ACTIVE_PAIRING_TTL_SECONDS * 1000,
+    );
+    const deviceToken = await signAppToken(
+      { sub: id, kind: "web", pairingId: id },
+      env,
+      `${env.ACTIVE_PAIRING_TTL_SECONDS}s`,
+    );
+    await store.setSession({
+      tokenHash: hashSecret(deviceToken),
+      pairingId: id,
+      kind: "web",
+      expiresAt: sessionExpiresAt,
+    });
+    return c.json(json({ ...viewPairing(pairing, true), deviceToken }));
+  });
+  app.post("/api/v1/pairing/:id/regenerate", async (c) => {
+    const pairing = await pairingFor(c.req.param("id"));
+    if (!pairing || pairing.status !== "pending")
+      return c.json(
+        failure("PAIRING_UNAVAILABLE", "جلسة الاقتران غير متاحة", 410).body,
+        410,
+      );
+    const manualCode = generatePairingCode();
+    pairing.codeHash = hashSecret(manualCode);
+    pairing.manualCode = manualCode;
+    pairing.attempts = 0;
+    pairing.expiresAt = new Date(
+      Date.now() + env.PAIRING_CODE_TTL_SECONDS * 1000,
+    );
+    pairing.used = false;
+    await store.setPairing(pairing);
+    return c.json(
+      json({ manualCode, expiresAt: pairing.expiresAt.toISOString() }),
+    );
+  });
+  app.post("/api/v1/pairing/claim/manual", async (c) => {
+    const claims = await auth(c);
+    if (!claims || claims.kind !== "mini-app")
+      return c.json(
+        failure("UNAUTHORIZED", "يلزم تسجيل الدخول من Mini App", 401).body,
+        401,
+      );
+    const parsed = manualClaimSchema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!parsed.success)
+      return c.json(failure("INVALID_CODE", "رمز الاقتران غير صالح").body, 400);
+    const pairing = await store.findPendingPairingByCodeHash(
+      hashSecret(parsed.data.code),
+      now(),
+    );
+    if (!pairing || pairing.attempts >= 5 || pairing.used)
+      return c.json(
+        failure("PAIRING_UNAVAILABLE", "رمز الاقتران غير صالح أو منتهي", 410)
+          .body,
+        410,
+      );
+    pairing.status = "claimed";
+    pairing.userId = String(claims.sub);
+    pairing.userName = String(claims.name || claims.email);
+    pairing.used = true;
+    await store.setPairing(pairing);
+    publish(pairing.id, "pairing.claimed", { status: pairing.status, device: pairing.device });
+    return c.json(
+      json({
+        id: pairing.id,
+        status: pairing.status,
+        device: pairing.device,
+        expiresAt: pairing.expiresAt.toISOString(),
+      } as PairingStatusView),
+    );
+  });
+  app.post("/api/v1/pairing/claim/qr", async (c) => {
+    const claims = await auth(c);
+    if (!claims || claims.kind !== "mini-app")
+      return c.json(
+        failure("UNAUTHORIZED", "يلزم تسجيل الدخول من Mini App", 401).body,
+        401,
+      );
+    const parsed = qrClaimSchema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!parsed.success)
+      return c.json(failure("INVALID_QR", "رمز QR غير صالح").body, 400);
+    let qr: { sessionId: string; nonce: string };
+    try {
+      qr = parseQrPayload(
+        `${parsed.data.sessionId}.${parsed.data.nonce}.${parsed.data.signature}`,
+        env.PAIRING_TOKEN_SECRET,
+      );
+    } catch {
+      return c.json(failure("INVALID_QR", "رمز QR غير صالح").body, 400);
+    }
+    const pairing = await pairingFor(qr.sessionId);
+    if (!pairing || pairing.nonce !== qr.nonce || pairing.status !== "pending")
+      return c.json(
+        failure("PAIRING_UNAVAILABLE", "جلسة الاقتران غير متاحة", 410).body,
+        410,
+      );
+    pairing.status = "claimed";
+    pairing.userId = String(claims.sub);
+    pairing.userName = String(claims.name || claims.email);
+    pairing.used = true;
+    await store.setPairing(pairing);
+    publish(pairing.id, "pairing.claimed", { status: pairing.status, device: pairing.device });
+    return c.json(
+      json({
+        id: pairing.id,
+        status: pairing.status,
+        device: pairing.device,
+        expiresAt: pairing.expiresAt.toISOString(),
+      } as PairingStatusView),
+    );
+  });
+  app.get("/api/v1/pairing/:id", async (c) => {
+    const claims = await auth(c);
+    const pairing = await pairingFor(c.req.param("id"));
+    if (
+      !claims ||
+      !pairing ||
+      (claims.kind === "web" && claims.pairingId !== pairing.id) ||
+      (claims.kind === "mini-app" && pairing.userId !== String(claims.sub))
+    )
+      return c.json(
+        failure("FORBIDDEN", "لا يمكن الوصول إلى هذه الجلسة", 403).body,
+        403,
+      );
+    return c.json(
+      json({
+        id: pairing.id,
+        status: pairing.status,
+        expiresAt: pairing.expiresAt.toISOString(),
+        userName: pairing.userName,
+        device: pairing.device,
+      } as PairingStatusView),
+    );
+  });
+  app.post("/api/v1/pairing/:id/confirm", async (c) => {
+    const claims = await auth(c);
+    const pairing = await pairingFor(c.req.param("id"));
+    if (
+      !claims ||
+      !pairing ||
+      pairing.userId !== String(claims.sub) ||
+      pairing.status !== "claimed"
+    )
+      return c.json(
+        failure("FORBIDDEN", "لا يمكن تأكيد هذه الجلسة", 403).body,
+        403,
+      );
+    pairing.status = "active";
+    pairing.expiresAt = new Date(
+      Date.now() + env.ACTIVE_PAIRING_TTL_SECONDS * 1000,
+    );
+    await store.setPairing(pairing);
+    publish(pairing.id, "pairing.active", { status: pairing.status });
+    return c.json(json({ status: pairing.status }));
+  });
+  app.post("/api/v1/pairing/:id/reject", async (c) => {
+    const claims = await auth(c);
+    const pairing = await pairingFor(c.req.param("id"));
+    if (
+      !claims ||
+      !pairing ||
+      pairing.userId !== String(claims.sub) ||
+      pairing.status !== "claimed"
+    )
+      return c.json(
+        failure("FORBIDDEN", "لا يمكن رفض هذه الجلسة", 403).body,
+        403,
+      );
+    pairing.status = "rejected";
+    await store.setPairing(pairing);
+    publish(pairing.id, "pairing.rejected", { status: pairing.status });
+    return c.json(json({ status: pairing.status }));
+  });
+  app.post("/api/v1/pairing/:id/close", async (c) => {
+    const claims = await auth(c);
+    const pairing = await pairingFor(c.req.param("id"));
+    if (
+      !claims ||
+      !pairing ||
+      (claims.kind !== "web" && pairing.userId !== String(claims.sub)) ||
+      (claims.kind === "web" && claims.pairingId !== pairing.id)
+    )
+      return c.json(
+        failure("FORBIDDEN", "لا يمكن إغلاق هذه الجلسة", 403).body,
+        403,
+      );
+    pairing.status = "closed";
+    await store.setPairing(pairing);
+    publish(pairing.id, "pairing.closed", { status: pairing.status });
+    return c.json(json({ status: pairing.status }));
+  });
 
-  app.post("/api/v1/pairing/:id/transfers/text", async (c) => { const context = await activePairing(c); const body = textTransferSchema.safeParse(await c.req.json().catch(() => ({}))); if (!context || !body.success) return c.json(failure(context ? "INVALID_TEXT" : "FORBIDDEN", context ? "لا يمكن إرسال النص" : "الجلسة غير فعالة", context ? 400 : 403).body, context ? 400 : 403); const sender = context.claims.kind as "web" | "mini-app"; const transfer: Transfer = { id: randomId(), pairingId: context.pairing.id, sender, receiver: sender === "web" ? "mini-app" : "web", contentType: "text", text: body.data.text, status: "ready", createdAt: now(), expiresAt: new Date(Date.now() + env.TRANSFER_TTL_SECONDS * 1000) }; await store.setTransfer(transfer); return c.json(json(viewTransfer(transfer))); });
-  app.post("/api/v1/pairing/:id/transfers/url", async (c) => { const context = await activePairing(c); const body = urlTransferSchema.safeParse(await c.req.json().catch(() => ({}))); if (!context || !body.success) return c.json(failure(context ? "INVALID_URL" : "FORBIDDEN", context ? "لا يمكن إرسال الرابط" : "الجلسة غير فعالة", context ? 400 : 403).body, context ? 400 : 403); const sender = context.claims.kind as "web" | "mini-app"; const transfer: Transfer = { id: randomId(), pairingId: context.pairing.id, sender, receiver: sender === "web" ? "mini-app" : "web", contentType: "url", url: body.data.url, status: "ready", createdAt: now(), expiresAt: new Date(Date.now() + env.TRANSFER_TTL_SECONDS * 1000) }; await store.setTransfer(transfer); return c.json(json(viewTransfer(transfer))); });
-  app.post("/api/v1/pairing/:id/uploads/authorize", async (c) => { const context = await activePairing(c); const body = uploadMetadataSchema.safeParse(await c.req.json().catch(() => ({}))); if (!context || !body.success) return c.json(failure(context ? "INVALID_FILE" : "FORBIDDEN", context ? "لا يمكن تجهيز رفع الملف" : "الجلسة غير فعالة", context ? 400 : 403).body, context ? 400 : 403); const transferId = randomId(); const sender = context.claims.kind as "web" | "mini-app"; const transfer: Transfer = { id: transferId, pairingId: context.pairing.id, sender, receiver: sender === "web" ? "mini-app" : "web", contentType: "file", filename: body.data.filename, displayFilename: body.data.filename.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").slice(0, 120), mimeType: body.data.mimeType, size: body.data.size, status: "uploading", createdAt: now(), expiresAt: new Date(Date.now() + env.TRANSFER_TTL_SECONDS * 1000), blobPath: `transfers/${context.pairing.id}/${transferId}` }; await store.setTransfer(transfer); return c.json(json({ transferId, uploadUrl: env.BLOB_READ_WRITE_TOKEN ? "issued-by-vercel-blob-adapter" : null, blobPath: transfer.blobPath })); });
-  app.post("/api/v1/transfers/:id/complete", async (c) => { const claims = await auth(c); const transfer = await store.getTransfer(c.req.param("id")); const pairing = transfer ? await pairingFor(transfer.pairingId) : undefined; const authorized = !!claims && !!transfer && !!pairing && pairing.status === "active" && transfer.sender === claims.kind && (claims.kind === "web" ? claims.pairingId === pairing.id : pairing.userId === String(claims.sub)); if (!authorized || transfer!.status !== "uploading") return c.json(failure("FORBIDDEN", "لا يمكن تأكيد هذا الرفع", 403).body, 403); transfer!.status = "ready"; await store.setTransfer(transfer!); return c.json(json(viewTransfer(transfer!))); });
-  app.get("/api/v1/pairing/:id/transfers", async (c) => { if (!await activePairing(c)) return c.json(failure("FORBIDDEN", "الجلسة غير فعالة", 403).body, 403); return c.json(json((await store.listTransfersByPairing(c.req.param("id"))).filter((transfer) => transfer.status !== "deleted").map(viewTransfer))); });
-  app.post("/api/v1/transfers/:id/download", async (c) => { const claims = await auth(c); const transfer = await store.getTransfer(c.req.param("id")); const pairing = transfer ? await pairingFor(transfer.pairingId) : undefined; const authorized = !!claims && !!transfer && !!pairing && pairing.status === "active" && transfer.status === "ready" && transfer.receiver === claims.kind && (claims.kind === "web" ? claims.pairingId === pairing.id : pairing.userId === String(claims.sub)); if (!authorized) return c.json(failure("FORBIDDEN", "لا يمكن تنزيل هذا العنصر", 403).body, 403); return c.json(json({ downloadUrl: transfer!.contentType === "file" && env.BLOB_READ_WRITE_TOKEN ? "issued-by-vercel-blob-adapter" : null, transfer: viewTransfer(transfer!) })); });
-  app.post("/api/v1/transfers/:id/downloaded", async (c) => { const claims = await auth(c); const transfer = await store.getTransfer(c.req.param("id")); const pairing = transfer ? await pairingFor(transfer.pairingId) : undefined; const authorized = !!claims && !!transfer && !!pairing && pairing.status === "active" && transfer.receiver === claims.kind && (claims.kind === "web" ? claims.pairingId === pairing.id : pairing.userId === String(claims.sub)); if (!authorized) return c.json(failure("FORBIDDEN", "لا يمكن تحديث هذا العنصر", 403).body, 403); transfer!.status = "downloaded"; transfer!.downloadedAt = now(); await store.setTransfer(transfer!); return c.json(json({ status: transfer!.status })); });
-  app.delete("/api/v1/transfers/:id", async (c) => { const claims = await auth(c); const transfer = await store.getTransfer(c.req.param("id")); if (!claims || !transfer || transfer.pairingId !== String(claims.pairingId)) return c.json(failure("FORBIDDEN", "لا يمكن حذف هذا العنصر", 403).body, 403); transfer.status = "deleted"; transfer.deletedAt = now(); await store.setTransfer(transfer); return c.json(json({ status: transfer.status })); });
-  app.post("/api/v1/cleanup", async (c) => { if (c.req.header("X-Cron-Secret") !== env.CRON_SECRET) return c.json(failure("UNAUTHORIZED", "غير مصرح", 401).body, 401); let expired = 0; for (const pairing of await store.listPairings()) if (pairing.expiresAt <= now() && pairing.status !== "closed") { pairing.status = "expired"; await store.setPairing(pairing); expired++; } for (const transfer of await store.listTransfers()) if (transfer.expiresAt <= now() && transfer.status !== "deleted") { transfer.status = "expired"; await store.setTransfer(transfer); expired++; } return c.json(json({ expired })); });
-  app.notFound((c) => c.json(failure("NOT_FOUND", "المسار غير موجود", 404).body, 404));
+  app.post("/api/v1/pairing/:id/transfers/text", async (c) => {
+    const context = await activePairing(c);
+    const body = textTransferSchema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!context || !body.success)
+      return c.json(
+        failure(
+          context ? "INVALID_TEXT" : "FORBIDDEN",
+          context ? "لا يمكن إرسال النص" : "الجلسة غير فعالة",
+          context ? 400 : 403,
+        ).body,
+        context ? 400 : 403,
+      );
+    const sender = context.claims.kind as "web" | "mini-app";
+    const transfer: Transfer = {
+      id: randomId(),
+      pairingId: context.pairing.id,
+      sender,
+      receiver: sender === "web" ? "mini-app" : "web",
+      contentType: "text",
+      text: body.data.text,
+      status: "ready",
+      createdAt: now(),
+      expiresAt: new Date(Date.now() + env.TRANSFER_TTL_SECONDS * 1000),
+    };
+    await store.setTransfer(transfer);
+    publish(transfer.pairingId, "transfer.created", { transferId: transfer.id, status: transfer.status, contentType: transfer.contentType });
+    return c.json(json(viewTransfer(transfer)));
+  });
+  app.post("/api/v1/pairing/:id/transfers/url", async (c) => {
+    const context = await activePairing(c);
+    const body = urlTransferSchema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!context || !body.success)
+      return c.json(
+        failure(
+          context ? "INVALID_URL" : "FORBIDDEN",
+          context ? "لا يمكن إرسال الرابط" : "الجلسة غير فعالة",
+          context ? 400 : 403,
+        ).body,
+        context ? 400 : 403,
+      );
+    const sender = context.claims.kind as "web" | "mini-app";
+    const transfer: Transfer = {
+      id: randomId(),
+      pairingId: context.pairing.id,
+      sender,
+      receiver: sender === "web" ? "mini-app" : "web",
+      contentType: "url",
+      url: body.data.url,
+      status: "ready",
+      createdAt: now(),
+      expiresAt: new Date(Date.now() + env.TRANSFER_TTL_SECONDS * 1000),
+    };
+    await store.setTransfer(transfer);
+    publish(transfer.pairingId, "transfer.created", { transferId: transfer.id, status: transfer.status, contentType: transfer.contentType });
+    return c.json(json(viewTransfer(transfer)));
+  });
+  app.post("/api/v1/pairing/:id/uploads/authorize", async (c) => {
+    const context = await activePairing(c);
+    const body = uploadMetadataSchema.safeParse(
+      await c.req.json().catch(() => ({})),
+    );
+    if (!context || !body.success)
+      return c.json(
+        failure(
+          context ? "INVALID_FILE" : "FORBIDDEN",
+          context ? "لا يمكن تجهيز رفع الملف" : "الجلسة غير فعالة",
+          context ? 400 : 403,
+        ).body,
+        context ? 400 : 403,
+      );
+    const transferId = randomId();
+    const sender = context.claims.kind as "web" | "mini-app";
+    const transfer: Transfer = {
+      id: transferId,
+      pairingId: context.pairing.id,
+      sender,
+      receiver: sender === "web" ? "mini-app" : "web",
+      contentType: "file",
+      filename: body.data.filename,
+      displayFilename: body.data.filename
+        .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_")
+        .slice(0, 120),
+      mimeType: body.data.mimeType,
+      size: body.data.size,
+      status: "uploading",
+      createdAt: now(),
+      expiresAt: new Date(Date.now() + env.TRANSFER_TTL_SECONDS * 1000),
+      blobPath: `transfers/${context.pairing.id}/${transferId}`,
+    };
+    await store.setTransfer(transfer);
+    return c.json(
+      json({
+        transferId,
+        uploadUrl: env.BLOB_READ_WRITE_TOKEN
+          ? "issued-by-vercel-blob-adapter"
+          : null,
+        blobPath: transfer.blobPath,
+      }),
+    );
+  });
+  app.post("/api/v1/transfers/:id/complete", async (c) => {
+    const claims = await auth(c);
+    const transfer = await store.getTransfer(c.req.param("id"));
+    const pairing = transfer ? await pairingFor(transfer.pairingId) : undefined;
+    const authorized =
+      !!claims &&
+      !!transfer &&
+      !!pairing &&
+      pairing.status === "active" &&
+      transfer.sender === claims.kind &&
+      (claims.kind === "web"
+        ? claims.pairingId === pairing.id
+        : pairing.userId === String(claims.sub));
+    if (!authorized || transfer!.status !== "uploading")
+      return c.json(
+        failure("FORBIDDEN", "لا يمكن تأكيد هذا الرفع", 403).body,
+        403,
+      );
+    transfer!.status = "ready";
+    await store.setTransfer(transfer!);
+    publish(transfer!.pairingId, "transfer.ready", { transferId: transfer!.id, status: transfer!.status });
+    return c.json(json(viewTransfer(transfer!)));
+  });
+  app.get("/api/v1/pairing/:id/transfers", async (c) => {
+    if (!(await activePairing(c)))
+      return c.json(failure("FORBIDDEN", "الجلسة غير فعالة", 403).body, 403);
+    return c.json(
+      json(
+        (await store.listTransfersByPairing(c.req.param("id")))
+          .filter((transfer) => transfer.status !== "deleted")
+          .map(viewTransfer),
+      ),
+    );
+  });
+  app.post("/api/v1/transfers/:id/download", async (c) => {
+    const claims = await auth(c);
+    const transfer = await store.getTransfer(c.req.param("id"));
+    const pairing = transfer ? await pairingFor(transfer.pairingId) : undefined;
+    const authorized =
+      !!claims &&
+      !!transfer &&
+      !!pairing &&
+      pairing.status === "active" &&
+      transfer.status === "ready" &&
+      transfer.receiver === claims.kind &&
+      (claims.kind === "web"
+        ? claims.pairingId === pairing.id
+        : pairing.userId === String(claims.sub));
+    if (!authorized)
+      return c.json(
+        failure("FORBIDDEN", "لا يمكن تنزيل هذا العنصر", 403).body,
+        403,
+      );
+    return c.json(
+      json({
+        downloadUrl:
+          transfer!.contentType === "file" && env.BLOB_READ_WRITE_TOKEN
+            ? "issued-by-vercel-blob-adapter"
+            : null,
+        transfer: viewTransfer(transfer!),
+      }),
+    );
+  });
+  app.post("/api/v1/transfers/:id/downloaded", async (c) => {
+    const claims = await auth(c);
+    const transfer = await store.getTransfer(c.req.param("id"));
+    const pairing = transfer ? await pairingFor(transfer.pairingId) : undefined;
+    const authorized =
+      !!claims &&
+      !!transfer &&
+      !!pairing &&
+      pairing.status === "active" &&
+      transfer.receiver === claims.kind &&
+      (claims.kind === "web"
+        ? claims.pairingId === pairing.id
+        : pairing.userId === String(claims.sub));
+    if (!authorized)
+      return c.json(
+        failure("FORBIDDEN", "لا يمكن تحديث هذا العنصر", 403).body,
+        403,
+      );
+    transfer!.status = "downloaded";
+    transfer!.downloadedAt = now();
+    await store.setTransfer(transfer!);
+    publish(transfer!.pairingId, "transfer.downloaded", { transferId: transfer!.id, status: transfer!.status });
+    return c.json(json({ status: transfer!.status }));
+  });
+  app.delete("/api/v1/transfers/:id", async (c) => {
+    const claims = await auth(c);
+    const transfer = await store.getTransfer(c.req.param("id"));
+    if (!claims || !transfer || transfer.pairingId !== String(claims.pairingId))
+      return c.json(
+        failure("FORBIDDEN", "لا يمكن حذف هذا العنصر", 403).body,
+        403,
+      );
+    transfer.status = "deleted";
+    transfer.deletedAt = now();
+    await store.setTransfer(transfer);
+    publish(transfer.pairingId, "transfer.deleted", { transferId: transfer.id, status: transfer.status });
+    return c.json(json({ status: transfer.status }));
+  });
+  app.post("/api/v1/cleanup", async (c) => {
+    if (c.req.header("X-Cron-Secret") !== env.CRON_SECRET)
+      return c.json(failure("UNAUTHORIZED", "غير مصرح", 401).body, 401);
+    let expired = 0;
+    for (const pairing of await store.listPairings())
+      if (pairing.expiresAt <= now() && pairing.status !== "closed") {
+        pairing.status = "expired";
+        await store.setPairing(pairing);
+        expired++;
+      }
+    for (const transfer of await store.listTransfers())
+      if (transfer.expiresAt <= now() && transfer.status !== "deleted") {
+        transfer.status = "expired";
+        await store.setTransfer(transfer);
+        expired++;
+      }
+    return c.json(json({ expired }));
+  });
+  app.notFound((c) =>
+    c.json(failure("NOT_FOUND", "المسار غير موجود", 404).body, 404),
+  );
   return app;
 }

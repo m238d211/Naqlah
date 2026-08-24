@@ -48,7 +48,7 @@ npm run build:api
 
 ## Environment variables
 
-See `.env.example`. Required production values include `MONGODB_URI`, `DATABASE_NAME`, `JWT_SECRET`, `PAIRING_TOKEN_SECRET`, `SUPERAPP_SHARED_SECRET`, `MINI_APP_ID`, `CRON_SECRET`, `BLOB_READ_WRITE_TOKEN`, `ALLOWED_ORIGINS`, `WEB_APP_ORIGIN`, `MINI_APP_ORIGIN`, and transfer/expiration limits. Only `VITE_API_BASE_URL` is safe for frontend builds. Never prefix backend secrets with `VITE_`.
+See `.env.example`. Required production values include `MONGODB_URI`, `DATABASE_NAME`, `JWT_SECRET`, `PAIRING_TOKEN_SECRET`, `SUPERAPP_SHARED_SECRET`, `MINI_APP_ID`, `CRON_SECRET`, `BLOB_READ_WRITE_TOKEN`, `ABLY_API_KEY`, `ABLY_CHANNEL_PREFIX`, `ALLOWED_ORIGINS`, `WEB_APP_ORIGIN`, `MINI_APP_ORIGIN`, and transfer/expiration limits. Only `VITE_API_BASE_URL` is safe for frontend builds. Never prefix backend secrets with `VITE_`.
 
 `ALLOWED_ORIGINS` must contain the exact two Surge origins and explicitly approved local origins, comma-separated. Do not use `*` in production.
 
@@ -65,6 +65,12 @@ Client uploads use `@vercel/blob/client` with the API's `/api/v1/uploads/handle`
 Production uses the official MongoDB Node.js driver with a cached connection pool. The data model is `users`, `pairing_sessions`, `device_sessions`, and `transfers`. Startup creates indexes for user identifiers, pairing ownership/code/status/expiration, device-session tokens/expiration, and transfer session/status/expiration. Pairing and device sessions use MongoDB TTL indexes. Transfers use a normal expiration index so metadata is not removed before the cleanup job can delete the corresponding private Blob object.
 
 The protected `POST /api/v1/cleanup` endpoint (header `X-Cron-Secret`) processes expired records idempotently. Configure cron-job.org to call the deployed endpoint daily; no Vercel Cron is used. The health endpoint now runs a MongoDB `ping` and returns `database: "ok"` only when MongoDB is reachable.
+
+## Realtime delivery
+
+Naqlah uses Ably for the long-lived connection. Each pairing receives a private channel named `naqlah:pairing:<pairingId>`. The API keeps `ABLY_API_KEY` server-side, issues a short-lived subscribe-only token after checking the Naqlah device session, and publishes pairing and transfer events from the API. The web app and Mini App fetch the current state once when an event arrives; they do not continuously poll `pairing` or `transfers`.
+
+Create an Ably app and a server API key with `publish` and `subscribe` capability scoped to `naqlah:pairing:*`, then add `ABLY_API_KEY` and `ABLY_CHANNEL_PREFIX=naqlah` only to the API environment. Never add the key to either frontend or a `VITE_` variable.
 
 ## Deployment
 
@@ -93,11 +99,11 @@ Output Directory: (empty; Functions)
 
 The API build script compiles the three workspace packages to `dist` before compiling the API. This is required because Vercel runs Node.js against JavaScript output and must not load the shared packages' TypeScript source files at runtime.
 
-Add the API environment variables in the Vercel project, configure MongoDB Atlas network access and the Vercel Blob private token, and set the daily Cron secret in the Vercel environment. Do not deploy or create these external resources without explicit approval.
+Add the API environment variables in the Vercel project, configure MongoDB Atlas network access, the Vercel Blob private token, and the Ably server API key. Configure cron-job.org with the daily Cron secret. Do not deploy or create these external resources without explicit approval.
 
 ## Testing and limitations
 
-The included API tests cover safe code generation and hashing, pairing creation, and cron authorization. The initial UI is a lightweight functional shell with polling and accessible form states. QR camera integration, a real Vercel Blob `handleUpload` adapter, browser download confirmation, and end-to-end SSO integration require deployment credentials and platform-specific integration configuration. WebSockets are intentionally deferred; the query layer polls about every two seconds and can be replaced later without changing the UI contract.
+The included API tests cover safe code generation and hashing, pairing creation, active-session expiry behavior, cron authorization, and realtime configuration boundaries. Ably is a managed realtime service rather than a WebSocket server hosted in Vercel; clients still need a valid Ably app/key configured in the API deployment. WebSockets are not hosted by Naqlah itself.
 
 ## Structure
 

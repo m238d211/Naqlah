@@ -41,4 +41,17 @@ describe("API boundaries", () => {
     const response = await app.request("/api/v1/cleanup", { method: "POST" });
     assert.equal(response.status, 401);
   });
+
+  it("does not issue realtime credentials when Ably is not configured", async () => {
+    const store = new MemoryStore();
+    const env = loadEnv({ NODE_ENV: "test", ALLOWED_ORIGINS: "http://localhost:5173" });
+    const app = createApp({ env, store });
+    const webResponse = await app.request("/api/v1/pairing", { method: "POST" });
+    const webBody = await webResponse.json() as any;
+    const token = webBody.data.deviceToken as string;
+    await store.setSession({ tokenHash: hashSecret(token), pairingId: webBody.data.id, kind: "web", expiresAt: new Date(Date.now() + 3600000) });
+    const response = await app.request(`/api/v1/realtime/token?pairingId=${webBody.data.id}`, { headers: { Authorization: `Bearer ${token}` } });
+    assert.equal(response.status, 503);
+    assert.equal((await response.json() as any).error.code, "REALTIME_NOT_CONFIGURED");
+  });
 });

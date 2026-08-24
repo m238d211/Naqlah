@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import jsQR from "jsqr";
 import { upload as blobUpload } from "@vercel/blob/client";
@@ -25,6 +25,7 @@ import type {
   PairingStatusView,
   TransferView,
 } from "@naqlah/shared-types";
+import { connectRealtime } from "./realtime";
 
 const codePattern = /^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/;
 const messageOf = (error: unknown, fallback: string) =>
@@ -485,22 +486,27 @@ export function MiniApp() {
         ),
       );
   }, [session]);
+  const queryClient = useQueryClient();
   const status = useQuery({
     queryKey: ["pairing", pair?.id],
     queryFn: () => pairing(pair!.id),
     enabled: !!pair,
-    refetchInterval: (query) =>
-      ["pending", "claimed"].includes(query.state.data?.status || "")
-        ? 2000
-        : false,
+    refetchInterval: false,
   });
   const incoming = useQuery({
     queryKey: ["transfers", pair?.id],
     queryFn: () => listTransfers(pair!.id),
     enabled: status.data?.status === "active",
-    refetchInterval: () => document.visibilityState === "visible" ? 2000 : false,
-    refetchOnWindowFocus: true,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
   });
+  useEffect(() => {
+    if (!pair) return;
+    return connectRealtime(pair.id, () => {
+      void queryClient.invalidateQueries({ queryKey: ["pairing", pair.id] });
+      void queryClient.invalidateQueries({ queryKey: ["transfers", pair.id] });
+    }, () => undefined);
+  }, [pair, queryClient]);
   const current = status.data || pair;
   if (authError)
     return (

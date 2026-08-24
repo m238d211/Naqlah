@@ -5,6 +5,7 @@ export const envSchema = z.object({
   JWT_SECRET: z.string().min(16).default('development-jwt-secret-change-me'), PAIRING_TOKEN_SECRET: z.string().min(16).default('development-pairing-secret-change-me'),
   SUPERAPP_SHARED_SECRET: z.string().min(16).default('development-superapp-secret-change-me'), MINI_APP_ID: z.string().min(1).default('development-mini-app-id'),
   CRON_SECRET: z.string().min(8).default('development-cron-secret'), BLOB_READ_WRITE_TOKEN: z.string().optional(),
+  ABLY_API_KEY: z.string().optional(), ABLY_CHANNEL_PREFIX: z.string().min(1).default('naqlah'),
   ALLOWED_ORIGINS: z.string().default('http://localhost:5173,http://localhost:5174'), WEB_APP_ORIGIN: z.string().url().default('http://localhost:5173'), MINI_APP_ORIGIN: z.string().url().default('http://localhost:5174'),
   TRANSFER_MAX_FILE_SIZE: z.coerce.number().int().positive().max(100 * 1024 * 1024).default(100 * 1024 * 1024), PAIRING_CODE_TTL_SECONDS: z.coerce.number().int().positive().default(120), ACTIVE_PAIRING_TTL_SECONDS: z.coerce.number().int().positive().default(86400), TRANSFER_TTL_SECONDS: z.coerce.number().int().positive().default(86400)
 });

@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { QRCodeSVG } from "qrcode.react";
 import { upload as blobUpload } from "@vercel/blob/client";
 import { authorizeUpload, closePairing, confirmDownloaded, createPairing, getPairing, regenerate, requestDownload, sendText, sendUrl, transfers, uploadHandleUrl } from "./api";
 import type { PairingSessionView, PairingStatusView, TransferView } from "@naqlah/shared-types";
+import { connectRealtime } from "./realtime";
 
 type IconName = "file" | "link" | "copy" | "refresh";
 function Icon({ name }: { name: IconName }) { const path = name === "file" ? "M6 3h8l4 4v14H6zM14 3v5h5" : name === "link" ? "M10 13a5 5 0 0 0 7.1.1l1.4-1.4a5 5 0 0 0-7.1-7.1L10 6" : name === "copy" ? "M9 9h10v10H9zM5 5h10v4" : "M20 11a8 8 0 1 0 1 4"; return <svg aria-hidden="true" viewBox="0 0 24 24" className="icon"><path d={path} fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>; }
@@ -34,8 +35,16 @@ function PairingCard({ pairing, current, setPairing }: { pairing: PairingSession
 export function WebApp() {
   const [pairing, setPairing] = useState<(PairingSessionView & { deviceToken: string }) | null>(null), [error, setError] = useState(""), [closed, setClosed] = useState(false);
   useEffect(() => { createPairing().then(setPairing).catch((cause) => setError(errorMessage(cause, "تعذر بدء الجلسة"))); }, []);
-  const status = useQuery({ queryKey: ["pairing", pairing?.id], queryFn: () => getPairing(pairing!.id), enabled: !!pairing, refetchInterval: (query) => ["active", "pending", "claimed"].includes(query.state.data?.status || "") ? 2000 : false });
-  const list = useQuery({ queryKey: ["transfers", pairing?.id], queryFn: () => transfers(pairing!.id), enabled: status.data?.status === "active", refetchInterval: () => document.visibilityState === "visible" ? 2000 : false, refetchOnWindowFocus: true });
+  const queryClient = useQueryClient();
+  const status = useQuery({ queryKey: ["pairing", pairing?.id], queryFn: () => getPairing(pairing!.id), enabled: !!pairing, refetchInterval: false });
+  const list = useQuery({ queryKey: ["transfers", pairing?.id], queryFn: () => transfers(pairing!.id), enabled: status.data?.status === "active", refetchInterval: false, refetchOnWindowFocus: false });
+  useEffect(() => {
+    if (!pairing) return;
+    return connectRealtime(pairing.id, () => {
+      void queryClient.invalidateQueries({ queryKey: ["pairing", pairing.id] });
+      void queryClient.invalidateQueries({ queryKey: ["transfers", pairing.id] });
+    }, () => undefined);
+  }, [pairing, queryClient]);
   if (error) return <main className="center"><section className="panel error-card"><p className="eyebrow">نَقلة / NAQLAH</p><h1>تعذر بدء الجلسة</h1><p>{error}</p><button type="button" onClick={() => location.reload()}>إعادة المحاولة</button></section></main>;
   if (!pairing) return <main className="center" aria-live="polite"><div className="loader" /><p>جارٍ تجهيز مساحة النقل…</p></main>;
   if (closed) return <main className="center"><section className="panel error-card"><p className="eyebrow">نَقلة / NAQLAH</p><h1>انتهت الجلسة</h1><p>تم فصل الجهازين بنجاح. يمكنك إنشاء جلسة جديدة متى احتجت.</p><button type="button" onClick={() => location.reload()}>بدء جلسة جديدة</button></section></main>;
